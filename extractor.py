@@ -1,66 +1,571 @@
-'''
-extractor.py
-Joshua Brown
-March 2, 2026
-Extract security requirement information from PDFs using gemma 3 1b (https://huggingface.co/google/gemma-3-1b-it)
-'''
-
 import os
-from pypdf import PdfReader
-from language_model import Language_Model
+import re
+import time
+import yaml
+import PyPDF2
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import format_helper
 
-def verify_input_pdf(path) -> bool:
-    path = os.path.realpath(path)
-    if not os.path.exists(path):
-        print(f"[Error]: No such file or no permission to access: \"{path}\"")
-        return False
-    if not os.path.isfile(path):
-        print(f"[Error]: File \"{path}\" is a directory")
-        return False
-    if not os.path.splitext(path)[-1].lower() == ".pdf":
-        print(f"[Error]: File \"{path}\" is not a PDF")
-        return False
-    return True
+torch.set_num_threads(8)
+torch.set_num_interop_threads(2)
 
-def zero_shot_prompt() -> str:
-    return """You are extracting structured data.
-Extract Key Data Elements from the section below.
-Return YAML in this format:
+_MODEL_CACHE = {"tokenizer": None, "model": None}
 
-elements:
-  - name: <element name>
-    requirements:
-      - <requirement text>
+MODEL_ID = "google/gemma-3-1b-it"
 
-Only include elements explicitly mentioned.
-Return YAML only."""
-    # return "Generate a YAML file, based on Key Data Elements you extract from the data below, mapping elements (labeled 'elementN' where 'N' is the numeric element id incrementing with each element, starting at 1) to their names and a list of requirements involving that element. Note that elements may have multiple requirements."
 
-def few_shot_prompt() -> str:
-    return "asdas"
+def _get_model_and_tokenizer():
+    """Load model + tokenizer once; return cached copies thereafter."""
+    if _MODEL_CACHE["model"] is None:
+        print("\n" + "=" * 60)
+        print("  MODEL LOADING")
+        print("=" * 60)
+        format_helper.progress(f"Downloading / loading {MODEL_ID} ...")
+        format_helper.progress("(First run downloads ~2 GB; subsequent runs use cache)")
 
-def chain_of_thought_prompt() -> str:
-    return "Generate a YAML"
+        t0 = time.time()
+        format_helper.progress("Loading tokenizer ...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        format_helper.progress(f"Tokenizer ready ({format_helper.fmt_time(time.time() - t0)})")
 
-def extract_key_data(document_content):
-    gemma = Language_Model(2048, "You are acting as part of a software security analysis tool. In your response, do not include follow-up questions or ask for clarifications; simply respond with the answers to the prompted questions. Should you be asked to generate a file, enclose its contents in a markdown code block with the appropriate file type.")
-    zero_shot_out = gemma.raw_prompt(f"{zero_shot_prompt()}\n\nBEGIN DATA:\n{document_content}")
+        t1 = time.time()
+        format_helper.progress("Loading model weights in bfloat16 ...")
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            dtype=torch.bfloat16,
+            device_map="cpu",
+        )
+        model.eval()
+        format_helper.progress(f"Model loaded ({format_helper.fmt_time(time.time() - t1)})")
 
-    with open("./PROMPT.md", "w") as out:
-        out.write(f"# LLM Name\ngemma-3-1b-it\n# Prompt Type\n{zero_shot_prompt()}\n# Prompt Type\nZero-Shot\n# LLM Output\n{zero_shot_out}")
-        print(f"[Info]: Prompt log written to ${os.path.realpath("./PROMPT.md")}")
+        _MODEL_CACHE["tokenizer"] = tokenizer
+        _MODEL_CACHE["model"] = model
 
-extracted_text = ""
-pdfpath = "./testing/cis-r1.pdf"
-if os.path.exists(os.path.splitext(pdfpath)[-2] + ".txt"):
-    with open(os.path.splitext(pdfpath)[-2] + ".txt", "r") as cache:
-        extracted_text = cache.read()
-else:
-    pdf = PdfReader(pdfpath)
-    for page in pdf.pages:
-        extracted_text += page.extract_text()
+        total = time.time() - t0
+        format_helper.progress(f"Total model load time: {format_helper.fmt_time(total)}")
+        print("=" * 60 + "\n")
+    return _MODEL_CACHE["tokenizer"], _MODEL_CACHE["model"]
 
-    with open(os.path.splitext(pdfpath)[-2] + ".txt", 'w') as out:
-        out.write(extracted_text)
-print(extracted_text)
-extract_key_data(extracted_text)
+
+def load_documents(pdf_path1: str, pdf_path2: str) -> tuple[str, str]:
+    texts = []
+    for path in (pdf_path1, pdf_path2):
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(f"Invalid path: {path!r}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"File not found: {path}")
+        if not path.lower().endswith(".pdf"):
+            raise ValueError(f"Not a PDF file: {path}")
+
+        reader = PyPDF2.PdfReader(path)
+        num_pages = len(reader.pages)
+        if num_pages == 0:
+            raise ValueError(f"PDF has no pages: {path}")
+
+        name = os.path.basename(path)
+        format_helper.progress(f"Reading {name} ({num_pages} pages) ...")
+        doc_text = []
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                doc_text.append(page_text)
+            if (i + 1) % 50 == 0:
+                format_helper.progress(f"  {name}: {i+1}/{num_pages} pages read")
+
+        full = "\n".join(doc_text)
+        if not full.strip():
+            raise ValueError(f"PDF has no extractable text: {path}")
+
+        format_helper.progress(f"  {name}: Done - {len(full):,} characters extracted")
+        texts.append(full)
+
+    return texts[0], texts[1]
+
+
+def build_zero_shot_prompt(document_text: str) -> str:
+    req_list = _extract_requirement_list(document_text)
+    prompt = (
+        "Group these CIS EKS security requirements into categories. "
+        "Give each category a short name and list which requirement numbers belong to it.\n\n"
+        f"{req_list}\n\n"
+        "Output format - one category per line:\n"
+        "Category Name: number1, number2, number3\n\n"
+        "Categories:"
+    )
+    return prompt
+
+
+def build_few_shot_prompt(document_text: str) -> str:
+    req_list = _extract_requirement_list(document_text)
+    prompt = (
+        "Group these CIS EKS security requirements into categories.\n\n"
+        "Example:\n"
+        "Audit Logging: 2.1.1, 2.1.2\n"
+        "Worker Node Configuration: 3.1.1, 3.1.2, 3.1.3, 3.1.4\n"
+        "Kubelet Security: 3.2.1, 3.2.2, 3.2.3\n"
+        "RBAC: 4.1.1, 4.1.2, 4.1.3\n\n"
+        f"Requirements:\n{req_list}\n\n"
+        "Group ALL requirements above into categories:\n"
+    )
+    return prompt
+
+
+def build_chain_of_thought_prompt(document_text: str) -> str:
+    req_list = _extract_requirement_list(document_text)
+    prompt = (
+        "I need to group CIS EKS security requirements into categories.\n\n"
+        f"Requirements:\n{req_list}\n\n"
+        "Let me think step by step:\n"
+        "- Requirements 2.x.x are about control plane logging\n"
+        "- Requirements 3.1.x are about worker node configuration files\n"
+        "- Requirements 3.2.x are about kubelet settings\n"
+        "- Requirements 4.1.x are about RBAC\n"
+        "- Requirements 4.2.x are about pod security\n"
+        "- And so on for each sub-section\n\n"
+        "Output one category per line as: Category Name: number1, number2, ...\n\n"
+    )
+    return prompt
+
+
+def extract_kdes_with_llm(
+    document_text: str,
+    prompt_builder,
+    doc_name: str,
+    output_dir: str = ".",
+) -> tuple[dict, str]:
+    tokenizer, model = _get_model_and_tokenizer()
+
+    # Extract the requirement lookup table
+    req_lookup = _extract_requirement_lookup(document_text)
+    prompt = prompt_builder(document_text)
+
+    format_helper.progress(f"Tokenizing prompt for {doc_name} ...")
+    chat = [{"role": "user", "content": prompt}]
+    input_text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=4096)
+    num_tokens = inputs["input_ids"].shape[-1]
+    format_helper.progress(f"Input: {num_tokens} tokens")
+
+    format_helper.progress("Generating response (max 512 new tokens) ...", end="")
+    t0 = time.time()
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            do_sample=False,
+            temperature=1.0,
+            repetition_penalty=1.3,
+        )
+    gen_time = time.time() - t0
+    num_gen = outputs[0].shape[0] - num_tokens
+    tps = num_gen / gen_time if gen_time > 0 else 0
+    print(f" done!", flush=True)
+    format_helper.progress(f"Generated {num_gen} tokens in {format_helper.fmt_time(gen_time)} ({tps:.1f} tok/s)")
+
+    generated_ids = outputs[0][inputs["input_ids"].shape[-1]:]
+    raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    format_helper.progress("Parsing LLM output and reconstructing KDEs ...")
+    kdes = _parse_category_output(raw_output, req_lookup, document_text)
+    num_elements = len(kdes)
+    total_reqs = sum(len(v.get("requirements", [])) for v in kdes.values())
+    format_helper.progress(f"Extracted {num_elements} KDEs with {total_reqs} total requirements")
+
+    return kdes, raw_output
+
+
+def collect_llm_outputs(results: list[dict], output_path: str = "llm_outputs.txt"):
+    with open(output_path, "w", encoding='utf-8') as f:
+        for r in results:
+            f.write(f"# {r['prompt_type']}\n")
+            f.write(f"*LLM Name*\n{r['llm_name']}\n")
+            f.write(f"*Prompt Used*\n{r['prompt']}\n")
+            f.write(f"*LLM Output*\n{r['llm_output']}\n")
+            f.write("\n" + "---" + "\n\n")
+    format_helper.progress(f"Saved all LLM outputs -> {output_path}")
+
+
+def _extract_requirement_list(full_text: str) -> str:
+    reqs = _extract_requirement_lookup(full_text)
+    lines = [f"{num} {title}" for num, title in sorted(
+        reqs.items(), key=lambda x: [int(p) for p in x[0].split(".")]
+    )]
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000]
+    return text
+
+
+def _extract_requirement_lookup(full_text: str) -> dict:
+    # Match X.Y.Z (3-level) requirement numbers only.
+    # 2-level numbers (X.Y) are CIS Controls references, not EKS requirements.
+    # Uses re.search to handle prefixes like "Page 20 Internal Only - General 2.1.2 Ensure..."
+    req_re = re.compile(
+        r"(\d+\.\d+\.\d+)\s+"
+        r"((?:Ensure|Enable|Minimize|Prefer|Restrict|Consider|Verify|Do not|Manage|"
+        r"Apply|Implement|Configure|Set|Disable|Limit|Avoid|Cluster|The default|"
+        r"Create|Encrypt).+)",
+        re.IGNORECASE,
+    )
+    reqs = {}
+    for line in full_text.split("\n"):
+        m = req_re.search(line)
+        if m:
+            num = m.group(1)
+            top = int(num.split(".")[0])
+            if top < 2 or top > 5:
+                continue
+            title = m.group(2).strip()
+            title = re.sub(r"\s*\((Manual|Automated)\).*", "", title)
+            title = re.sub(r"\s*Profile Applicability.*", "", title)
+            title = re.sub(r"\s*\.{3,}.*", "", title)  # Remove TOC dots
+            # Fix PDF hyphenation artifacts: "- " mid-word → ""
+            title = re.sub(r"\s+-\s+", "-", title)
+            # Fix double spaces
+            title = re.sub(r"\s{2,}", " ", title)
+            title = title.strip()
+            # Skip truncated ghost entries from changelog/appendix
+            if title.endswith("-") or title.endswith("of") or title.endswith("the"):
+                continue
+            if num not in reqs and len(title) > 10:
+                reqs[num] = title
+
+    # Filter ghost entries: real requirements appear 2+ times in the doc
+    # (once in TOC, once on the actual page). Changelog ghosts appear only once.
+    verified = {}
+    for num, title in reqs.items():
+        # Count how many times this requirement number appears followed by text
+        count = len(re.findall(re.escape(num) + r"\s+\w", full_text))
+        if count >= 2:
+            verified[num] = title
+    return verified
+
+
+def _parse_category_output(raw: str, req_lookup: dict, full_text: str = "") -> dict:
+    result = {}
+    idx = 0
+
+    # Clean the output
+    cleaned = raw.strip()
+    # Remove markdown fences
+    cleaned = re.sub(r"```(?:yaml)?\s*", "", cleaned)
+    cleaned = re.sub(r"```", "", cleaned)
+
+    for line in cleaned.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Remove leading bullets/numbers: "1. ", "- ", "* "
+        line = re.sub(r"^[\d]+\.\s+", "", line)
+        line = re.sub(r"^[-*•]\s+", "", line)
+        # Remove bold markers
+        line = re.sub(r"\*\*", "", line)
+
+        # Match "Category Name: 2.1.1, 3.1.2, ..." pattern
+        m = re.match(r"^(.+?):\s*(.+)$", line)
+        if m:
+            cat_name = m.group(1).strip()
+            rest = m.group(2).strip()
+
+            # Extract requirement numbers - ONLY keep ones that exist in lookup
+            nums = re.findall(r"(\d+\.\d+(?:\.\d+)?)", rest)
+            valid_nums = [n for n in nums if n in req_lookup] if req_lookup else nums
+            if valid_nums:
+                seen_in_cat = set()
+                reqs = []
+                for num in valid_nums:
+                    if num not in seen_in_cat:  # deduplicate within category
+                        seen_in_cat.add(num)
+                        if num in req_lookup:
+                            reqs.append(f"{num} {req_lookup[num]}")
+                        else:
+                            reqs.append(num)
+
+                idx += 1
+                result[f"element{idx}"] = {
+                    "name": cat_name,
+                    "requirements": reqs,
+                }
+
+    # Validate LLM output quality before accepting it
+    if result and req_lookup:
+        # 1. Deduplicate across categories (keep first occurrence only)
+        seen_global = set()
+        for key in list(result.keys()):
+            deduped = []
+            for r in result[key]["requirements"]:
+                m_num = re.match(r"^(\d+\.\d+(?:\.\d+)?)", r)
+                num = m_num.group(1) if m_num else r
+                if num not in seen_global:
+                    seen_global.add(num)
+                    deduped.append(r)
+            result[key]["requirements"] = deduped
+
+        # Remove empty categories after dedup
+        result = {k: v for k, v in result.items() if v["requirements"]}
+
+        # 2. Quality checks
+        max_cat_size = max((len(v["requirements"]) for v in result.values()), default=0)
+        num_kdes = len(result)
+        total_assigned = len(seen_global & set(req_lookup.keys()))
+        coverage = total_assigned / len(req_lookup) if req_lookup else 0
+
+        format_helper.progress(f"  LLM: {num_kdes} KDEs, {total_assigned}/{len(req_lookup)} reqs "
+                  f"({coverage:.0%} coverage), largest KDE={max_cat_size}")
+
+        # Reject LLM groupings if:
+        # - Low coverage (<50%)
+        # - Too few categories (everything lumped into <4 groups)
+        # - Any single category is bloated (>12 reqs = bad grouping)
+        use_fallback = False
+        if coverage < 0.50:
+            format_helper.progress("  (Low coverage - using section-based grouping)")
+            use_fallback = True
+        elif num_kdes < 4 and len(req_lookup) > 20:
+            format_helper.progress("  (Too few KDEs - LLM lumped everything together)")
+            use_fallback = True
+        elif max_cat_size > 12:
+            format_helper.progress("  (Oversized KDE detected - LLM grouping is poor)")
+            use_fallback = True
+
+        if use_fallback:
+            result = _group_by_sections(req_lookup, full_text)
+
+    # Fallback: if LLM output was unusable or no lookup available
+    if not result or sum(len(v["requirements"]) for v in result.values()) == 0:
+        format_helper.progress("  (Fallback: grouping by document section structure)")
+        result = _group_by_sections(req_lookup)
+
+    return result
+
+
+def _group_by_sections(req_lookup: dict, full_text: str = "") -> dict:
+    # Extract details for each requirement from the PDF text
+    req_details = _extract_requirement_details(full_text, req_lookup) if full_text else {}
+
+    result = {}
+    sorted_nums = sorted(req_lookup.keys(),
+                         key=lambda x: [int(p) for p in x.split(".")])
+    for i, num in enumerate(sorted_nums, 1):
+        title = req_lookup[num]
+        details = req_details.get(num, [])
+        # If no details extracted, use the numbered title as the single requirement
+        if not details:
+            details = [f"{num} {title}"]
+
+        result[f"element{i}"] = {
+            "name": title,
+            "requirements": details,
+        }
+    return result
+
+
+def _extract_requirement_details(full_text: str, req_lookup: dict) -> dict:
+    details = {}
+    sorted_nums = sorted(req_lookup.keys(),
+                         key=lambda x: [int(p) for p in x.split(".")])
+
+    for idx, num in enumerate(sorted_nums):
+        title = req_lookup[num]
+        # Find the requirement's content block in the text
+        # Look for "X.Y.Z Title (Manual/Automated) Profile Applicability"
+        pattern = re.escape(num) + r"\s+" + re.escape(title[:30])
+        matches = list(re.finditer(pattern, full_text))
+
+        # Find the match that has "Description" nearby (the actual page, not TOC)
+        block = ""
+        for m in matches:
+            candidate = full_text[m.start():m.start() + 3000]
+            if "Description" in candidate[:500]:
+                # Find where next requirement starts
+                next_num = sorted_nums[idx + 1] if idx + 1 < len(sorted_nums) else None
+                if next_num:
+                    next_pattern = re.escape(next_num) + r"\s+"
+                    next_match = re.search(next_pattern, full_text[m.start() + 50:])
+                    if next_match:
+                        block = full_text[m.start():m.start() + 50 + next_match.start()]
+                    else:
+                        block = candidate
+                else:
+                    block = candidate
+                break
+
+        if not block:
+            details[num] = [f"{num} {title}"]
+            continue
+
+        # Extract key sections from the block
+        points = []
+
+        # Description
+        desc = _extract_section(block, "Description", ["Rationale", "Impact", "Audit"])
+        if desc:
+            points.append(f"Description: {desc}")
+
+        # Rationale
+        rat = _extract_section(block, "Rationale", ["Impact", "Audit", "Remediation"])
+        if rat:
+            points.append(f"Rationale: {rat}")
+
+        # Impact
+        imp = _extract_section(block, "Impact Statement", ["Audit", "Remediation", "Default"])
+        if not imp:
+            imp = _extract_section(block, "Impact", ["Audit", "Remediation", "Default"])
+        if imp and imp.lower().strip(".") not in ("none", ""):
+            points.append(f"Impact: {imp}")
+
+        if not points:
+            points = [f"{num} {title}"]
+
+        details[num] = points
+
+    return details
+
+
+def _extract_section(block: str, section_name: str, end_markers: list) -> str:
+    pattern = re.escape(section_name) + r"[:\s]+"
+    m = re.search(pattern, block, re.IGNORECASE)
+    if not m:
+        return ""
+
+    start = m.end()
+    end = len(block)
+    for marker in end_markers:
+        marker_match = re.search(
+            r"(?:^|\s)" + re.escape(marker) + r"[:\s]",
+            block[start:], re.IGNORECASE
+        )
+        if marker_match and marker_match.start() + start < end:
+            end = marker_match.start() + start
+
+    text = block[start:end].strip()
+    # Clean up: collapse whitespace, limit length
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > 300:
+        text = text[:300].rsplit(" ", 1)[0] + "..."
+    return text
+
+
+def run_task1(pdf1: str, pdf2: str, output_dir: str = "output"):
+    os.makedirs(output_dir, exist_ok=True)
+    run_start = time.time()
+
+    print("\n" + "#" * 60)
+    print("  TASK 1: KDE EXTRACTION")
+    print(f"  PDF 1: {os.path.basename(pdf1)}")
+    print(f"  PDF 2: {os.path.basename(pdf2)}")
+    print(f"  Output: {output_dir}/")
+    print(f"  Threads: {torch.get_num_threads()} compute, "
+          f"{torch.get_num_interop_threads()} interop")
+    print(f"  Dtype: bfloat16")
+    print("#" * 60)
+
+    # ---- Step 1: Load documents ----
+    print("\n>> STEP 1/4: Loading PDF documents")
+    t0 = time.time()
+    text1, text2 = load_documents(pdf1, pdf2)
+    format_helper.progress(f"Both documents loaded in {format_helper.fmt_time(time.time() - t0)}")
+
+    format_helper.progress("Extracting requirement lists ...")
+    rl1 = _extract_requirement_lookup(text1)
+    rl2 = _extract_requirement_lookup(text2)
+    format_helper.progress(f"  {os.path.basename(pdf1)}: {len(rl1)} requirements found")
+    format_helper.progress(f"  {os.path.basename(pdf2)}: {len(rl2)} requirements found")
+
+    # ---- Step 2: Pre-load model ----
+    print("\n>> STEP 2/4: Loading Gemma-3-1B model")
+    _get_model_and_tokenizer()
+
+    # ---- Step 3: Run all prompt types ----
+    prompt_builders = {
+        "zero-shot": build_zero_shot_prompt,
+        "few-shot": build_few_shot_prompt,
+        "chain-of-thought": build_chain_of_thought_prompt,
+    }
+
+    all_results = []
+    best_kdes = {}  # doc_name -> (kdes_dict, score, prompt_type)
+    total_inferences = len(prompt_builders) * 2
+    current = 0
+
+    print(f"\n>> STEP 3/4: Running LLM inference ({total_inferences} runs total)")
+    step3_start = time.time()
+
+    for prompt_type, builder in prompt_builders.items():
+        for text, pdf_path in [(text1, pdf1), (text2, pdf2)]:
+            current += 1
+            doc_name = os.path.basename(pdf_path)
+
+            print(f"\n  ---- Run {current}/{total_inferences}: "
+                  f"{prompt_type} | {doc_name} ----")
+
+            kdes, raw_output = extract_kdes_with_llm(text, builder, doc_name, output_dir)
+
+            score = sum(len(v.get("requirements", [])) for v in kdes.values())
+            if doc_name not in best_kdes or score > best_kdes[doc_name][1]:
+                best_kdes[doc_name] = (kdes, score, prompt_type)
+                format_helper.progress(f"  ** New best for {doc_name}: {len(kdes)} KDEs, {score} reqs ({prompt_type})")
+
+            prompt_str = builder(text)
+            all_results.append({
+                "llm_name": MODEL_ID,
+                "prompt": prompt_str[:500] + "..." if len(prompt_str) > 500 else prompt_str,
+                "prompt_type": prompt_type,
+                "llm_output": raw_output,
+            })
+
+            elapsed = time.time() - step3_start
+            avg_per_run = elapsed / current
+            remaining = avg_per_run * (total_inferences - current)
+            format_helper.progress(f"Progress: {current}/{total_inferences} "
+                      f"| Elapsed: {format_helper.fmt_time(elapsed)} "
+                      f"| ETA: ~{format_helper.fmt_time(remaining)}")
+
+    # ---- Save best YAML per document ----
+    for doc_name, (kdes, score, pt) in best_kdes.items():
+        base = os.path.splitext(doc_name)[0]
+        yaml_path = os.path.join(output_dir, f"{base}-kdes.yaml")
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump(kdes, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        format_helper.progress(f"Best YAML for {doc_name} ({pt}, {len(kdes)} KDEs, {score} reqs) -> {yaml_path}")
+
+    # ---- Step 4: Save collected outputs ----
+    print(f"\n>> STEP 4/4: Saving collected LLM outputs")
+    output_txt = os.path.join(output_dir, "PROMPT.md")
+    collect_llm_outputs(all_results, output_txt)
+
+    # ---- Summary ----
+    total_time = time.time() - run_start
+    print("\n" + "#" * 60)
+    print("  TASK 1 COMPLETE")
+    print(f"  Total time: {format_helper.fmt_time(total_time)}")
+    print(f"  Output directory: {output_dir}/")
+    print(f"  YAML files generated:")
+    for doc_name, (kdes, score, pt) in best_kdes.items():
+        base = os.path.splitext(doc_name)[0]
+        n_kde = len(kdes)
+        print(f"    {base}-kdes.yaml: {n_kde} KDEs, {score} requirements (from {pt})")
+    print(f"  LLM output log: {output_txt}")
+    print("#" * 60 + "\n")
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        description="Uses Gemma 1b to extract KDEs from requirements documents."
+    )
+    parser.add_argument("document1", help="Path to first requirements document")
+    parser.add_argument("document2", help="Path to second requirements document")
+    parser.add_argument(
+        "--output-dir", default="extractor_outputs",
+        help="Directory for output files (default: extractor_outputs)"
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    run_task1(args.document1, args.document2, output_dir=args.output_dir)

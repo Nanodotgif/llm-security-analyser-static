@@ -1,2 +1,6 @@
-__pycache__/
-venv/
+venv
+output
+inputs
+*.exe
+__pycache__
+YAMLfiles
