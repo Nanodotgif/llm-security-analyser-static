@@ -448,8 +448,7 @@ def _extract_section(block: str, section_name: str, end_markers: list) -> str:
     return text
 
 
-def run_task1(pdf1: str, pdf2: str, output_dir: str = "output"):
-    os.makedirs(output_dir, exist_ok=True)
+def extract(pdf1: str, pdf2: str, output_dir: str = "output"):
     run_start = time.time()
 
     print("\n" + "#" * 60)
@@ -568,4 +567,4 @@ if __name__ == "__main__":
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    run_task1(args.document1, args.document2, output_dir=args.output_dir)
+    extract(args.document1, args.document2, output_dir=args.output_dir)

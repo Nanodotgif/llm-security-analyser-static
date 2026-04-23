@@ -199,17 +199,16 @@ class TestDetectDifferencesNames(unittest.TestCase):
             "element1": {"name": "Audit Logging", "requirements": []},
         }
 
-        result = comparator.detect_differences_names(
-            data1, "file1.yaml", data2, "file2.yaml"
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            comparator.detect_differences_names(data1, "file1.yaml", data2, "file2.yaml", tmp_dir)
 
-        self.assertIsInstance(result, list)
-        rbac_entries = [r for r in result if "RBAC Configuration" in r]
-        self.assertTrue(rbac_entries, "'RBAC Configuration' must appear as a difference")
-        self.assertTrue(
-            any("ABSENT-IN-file2.yaml" in r for r in rbac_entries),
-            "Missing name must be flagged as ABSENT in file2.yaml",
-        )
+            out_path = Path(tmp_dir) / Path("kde_name_diff.txt")
+            self.assertTrue(out_path.exists(), "kde_name_diff.txt must be created")
+
+            text = out_path.read_text(encoding="utf-8")
+        
+        self.assertTrue("RBAC Configuration" in text, "'RBAC Configuration' must appear as a difference")
+        self.assertTrue("ABSENT-IN-file2.yaml" in text, "Missing name must be flagged as ABSENT in file2.yaml")
 
 
 class TestDetectDifferencesRequirements(unittest.TestCase):
@@ -231,17 +230,18 @@ class TestDetectDifferencesRequirements(unittest.TestCase):
                 "name": "Audit Logging",
                 "requirements": ["2.1.1 Ensure audit logs"],
             }
-        }
+        } 
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            comparator.detect_differences_requirements(data1, "file1.yaml", data2, "file2.yaml", tmp_dir)
 
-        result = comparator.detect_differences_requirements(
-            data1, "file1.yaml", data2, "file2.yaml"
-        )
+            out_path = Path(tmp_dir) / Path("kde_name_req_diff.txt")
+            self.assertTrue(out_path.exists(), "kde_name_req_diff.txt must be created")
 
-        self.assertIsInstance(result, list)
-        self.assertTrue(
-            any("2.1.2 Ensure log retention" in r for r in result),
-            "The requirement missing from data2 must appear in the differences",
-        )
+            text = out_path.read_text(encoding="utf-8")
+        
+        self.assertTrue("2.1.2 Ensure log retention" in text, "The requirement missing from data2 must appear in the differences")
+
 
 
 # =============================================================================

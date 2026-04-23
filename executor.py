@@ -397,7 +397,9 @@ def kubescape_scan(kubescape_path:str | Path, control_map_path: str | Path, clus
     
     format_helper.progress(f"Running Kubescape ({kubescape_path}) scan on {cluster_path} based on controls listed in {control_map_path}")
     t0 = format_helper.time.time()
-    result = subprocess.run(f"{kubescape_path} scan --format json --output {Path(output_path)/Path("kubescape-results.json")} -v control {','.join(controls)} {cluster_path}")
+    scan_command = f"{kubescape_path} scan --format json --output {Path(output_path)/Path("kubescape-results.json")} -v control {','.join(controls)} {cluster_path}"
+    print(scan_command)
+    result = subprocess.run(scan_command)
     if result.returncode != 0:
         raise RuntimeError(f"Kubescape scan failed with return code {result.returncode}")
     format_helper.progress(f"Kubescape scan complete in {format_helper.fmt_time(format_helper.time.time() - t0)}")
@@ -429,10 +431,13 @@ def generate_csv(results_df: pandas.DataFrame, output_path: str | Path) -> None:
         elif 'object' in resource.keys() and 'sourcePath' in resource['object']:
             resource_map[resource_id] = resource['object']['sourcePath'].split(':')[0]
         elif 'object' in resource.keys() and 'relatedObjects' in resource['object'].keys():
-            related = set()
-            for related_object in resource['object']['relatedObjects']:
-                related.add(related_object['sourcePath'].split(':')[0])
-            resource_map[resource_id] = related
+            if 'sourcePath' in resource['object']['relatedObjects']:
+                resource_map[resource_id] = resource['object']['relatedObjects']['sourcePath']
+            else:
+                related = set()
+                for related_object in resource['object']['relatedObjects']:
+                    related.add(related_object['sourcePath'].split(':')[0])
+                resource_map[resource_id] = related
 
     headers = [
         'FilePath', 

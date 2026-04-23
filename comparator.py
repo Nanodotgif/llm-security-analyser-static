@@ -27,7 +27,7 @@ def load_yaml(path: str | Path) -> dict:
     return data
 
 
-def detect_differences_names(data1: dict, filename1: str, data2: dict, filename2: str):
+def detect_differences_names(data1: dict, filename1: str, data2: dict, filename2: str, output_path: str | Path):
     differences = []
     for element in data1.keys():
         if element not in data2.keys() or data1[element]["name"] not in [data2[element]["name"] for element in data2.keys()]:
@@ -36,9 +36,12 @@ def detect_differences_names(data1: dict, filename1: str, data2: dict, filename2
         if element not in data1.keys() or data2[element]["name"] not in [data1[element]["name"] for element in data1.keys()]:
             differences.append(f"{data2[element]["name"]},ABSENT-IN-{filename1},PRESENT-IN-{filename2}")
     format_helper.progress(f"{len(differences)} differences detected between {filename1} and {filename2}")
-    return differences if len(differences) > 0 else "NO DIFFERENCES IN REGARDS TO ELEMENT NAMES"
+    differences =  differences if len(differences) > 0 else ["NO DIFFERENCES IN REGARDS TO ELEMENT NAMES"]
+    with open(Path(output_path) / Path("kde_name_diff.txt"), 'w', encoding='utf-8') as outfile:
+        outfile.write('\n'.join(differences))
+        format_helper.progress(f"Successfully written {len(differences)} lines to {Path(output_path) / Path("kde_name_diff.txt")}")
 
-def detect_differences_requirements(data1: dict, filename1: str, data2: dict, filename2: str):
+def detect_differences_requirements(data1: dict, filename1: str, data2: dict, filename2: str, output_path: str | Path):
     differences = []
     for element in data1.keys():
         if element not in data2.keys() or data1[element]["name"] not in [data2[element]["name"] for element in data2.keys()]:
@@ -55,7 +58,10 @@ def detect_differences_requirements(data1: dict, filename1: str, data2: dict, fi
                 if requirement not in data1[element]["requirements"]:
                     differences.append(f"{data1[element]["name"]},ABSENT-IN-{filename1},PRESENT-IN-{filename2},{requirement}")
     format_helper.progress(f"{len(differences)} element differences (including requirements) detected between {filename1} and {filename2}")
-    return differences if len(differences) > 0 else "NO DIFFERENCES IN REGARDS TO ELEMENT REQUIREMENTS"
+    differences = differences if len(differences) > 0 else ["NO DIFFERENCES IN REGARDS TO ELEMENT REQUIREMENTS"]
+    with open(Path(output_path) / Path("kde_name_req_diff.txt"), 'w', encoding='utf-8') as outfile:
+        outfile.write('\n'.join(differences))
+        format_helper.progress(f"Successfully written {len(differences)} lines to {Path(output_path) / Path("kde_name_req_diff.txt")}")
 
 if __name__ == "__main__":
     import argparse
@@ -74,13 +80,5 @@ if __name__ == "__main__":
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    load_yaml(args.yaml1)
-    differences_names = detect_differences_names(load_yaml(args.yaml1), Path(args.yaml1).name, load_yaml(args.yaml2), Path(args.yaml2).name)
-    differences_requirements = detect_differences_requirements(load_yaml(args.yaml1), Path(args.yaml1).name, load_yaml(args.yaml2), Path(args.yaml2).name)
-
-    with open(Path(args.output_dir) / Path("kde_name_diff.txt"), 'w', encoding='utf-8') as outfile:
-        outfile.write('\n'.join(differences_names))
-        format_helper.progress(f"Successfully written {len(differences_names)} lines to {Path(args.output_dir) / Path("kde_name_diff.txt")}")
-    with open(Path(args.output_dir) / Path("kde_name_req_diff.txt"), 'w', encoding='utf-8') as outfile:
-        format_helper.progress(f"Successfully written {len(differences_names)} lines to {Path(args.output_dir) / Path("kde_name_req_diff.txt")}")
-        outfile.write('\n'.join(differences_requirements))
+    differences_names = detect_differences_names(load_yaml(args.yaml1), Path(args.yaml1).name, load_yaml(args.yaml2), Path(args.yaml2).name, Path(args.output_dir))
+    differences_requirements = detect_differences_requirements(load_yaml(args.yaml1), Path(args.yaml1).name, load_yaml(args.yaml2), Path(args.yaml2).name, Path(args.output_dir))
