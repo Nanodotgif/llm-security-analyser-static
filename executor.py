@@ -397,7 +397,7 @@ def kubescape_scan(kubescape_path:str | Path, control_map_path: str | Path, clus
     
     format_helper.progress(f"Running Kubescape ({kubescape_path}) scan on {cluster_path} based on controls listed in {control_map_path}")
     t0 = format_helper.time.time()
-    scan_command = f"{kubescape_path} scan --format json --output {Path(output_path)/Path("kubescape-results.json")} -v control {','.join(controls)} {cluster_path}"
+    scan_command = [f"{kubescape_path}", "scan", "--format", "json", "--output", f"{Path(output_path)/Path("kubescape-results.json")}", "-v", "control", f"{','.join(controls)}", f"{cluster_path}"]
     print(scan_command)
     result = subprocess.run(scan_command)
     if result.returncode != 0:
